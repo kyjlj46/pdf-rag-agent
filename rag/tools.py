@@ -1,22 +1,17 @@
 """RAG 파이프라인 단계별 도구.
 
-각 서브에이전트는 자기 단계의 도구만 받는다:
-  parser-agent    : inspect_pdf, extract_text_layer, read_page
-  ocr-agent       : ocr_pages, read_page
-  chunking-agent  : chunk_document, preview_chunks
-  retrieval-agent : search_chunks, get_chunk_context
+수집 단계(ocr_pages, chunk_document)는 rag.ingest 가 호출하고,
+질의응답 에이전트는 search_chunks / get_chunk_context / read_page 를 쓴다.
+inspect_pdf / extract_text_layer 는 텍스트 레이어 진단용으로 남겨 둔다.
 """
 
 from __future__ import annotations
 
-import base64
-import os
 import re
 from functools import lru_cache
+from pathlib import Path
 
 import pymupdf as fitz
-from .llm import make_model
-from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rank_bm25 import BM25L
@@ -113,55 +108,37 @@ def extract_text_layer(doc_id: str, pages: str = "all") -> str:
 
 @tool
 def read_page(doc_id: str, page: int) -> str:
-    """저장된 페이지 텍스트 전문을 읽는다 (추출/OCR 결과 검수용)."""
-    data = store.load_page(doc_id, page)
+    """저장된 페이지 텍스트 전문을 읽는다. doc_id 에는 문서 ID 또는 표시(D3)를 넣는다."""
+    label = doc_id.strip() if re.fullmatch(r"D\d+", doc_id.strip()) else ""
+    data = store.load_page(store.resolve(doc_id), page)
     if not data:
         return f"p.{page} 는 아직 추출되지 않았습니다."
-    return f"[p.{page} source={data['source']} quality={data['quality']}]\n{data['text']}"
+    return f"[{label + ' ' if label else ''}p.{page} source={data['source']} quality={data['quality']}]\n{data['text']}"
 
 
-# ─────────────────────────── 2. OCR (비전 모델) ───────────────────────────
-
-
-@lru_cache(maxsize=1)
-def _ocr_model():
-    return make_model(os.getenv("OCR_MODEL") or os.getenv("RAG_MODEL") or None)
-
-
-OCR_PROMPT = """이 이미지는 PDF 한 페이지입니다. 페이지의 모든 텍스트를 정확히 전사하세요.
-규칙:
-- 원문 그대로 옮기고 요약/번역/보정하지 마세요.
-- 제목은 '#', 소제목은 '##' 마크다운 헤더로 표시하세요.
-- 표는 마크다운 표로 옮기세요.
-- 읽을 수 없는 부분은 [판독불가] 로 표시하세요.
-- 전사한 텍스트만 출력하세요."""
+# ─────────────────────────── 2. OCR (로컬 OCR + LLM 정리) ───────────────────────────
 
 
 @tool
 def ocr_pages(doc_id: str, pages: str, dpi: int = 200) -> str:
-    """지정한 페이지를 이미지로 렌더링해 비전 모델로 OCR 하고 결과를 저장한다 (pages 예: '2,4-6').
+    """지정한 페이지를 이미지로 렌더링해 OCR 하고, LLM 으로 표/띄어쓰기/읽기 순서를 정리해 저장한다 (pages 예: '2,4-6').
 
-    스캔 페이지, 텍스트 레이어가 깨진 페이지, 표/도식이 많은 페이지에 사용한다.
+    결과가 부실한 페이지는 dpi=300 으로 다시 호출한다. 다시 OCR 한 뒤에는 chunk_document 로 재인덱싱해야 한다.
     """
+    from .ocr import ocr_page
+
     meta = store.load_meta(doc_id)
-    targets = _parse_pages(pages, meta["page_count"])
+    pdf = meta.get("pdf", meta["path"])
+    if not pdf:
+        return "이 문서는 PDF 가 없는 텍스트 문서라 OCR 할 수 없습니다."
     report = []
-    with fitz.open(meta["path"]) as pdf:
-        for p in targets:
-            png = pdf[p - 1].get_pixmap(dpi=dpi).tobytes("png")
-            msg = HumanMessage(
-                content=[
-                    {"type": "image", "base64": base64.b64encode(png).decode(), "mime_type": "image/png"},
-                    {"type": "text", "text": OCR_PROMPT},
-                ]
-            )
-            text = _ocr_model().invoke([msg]).text.strip()
-            q = _text_quality(text)
-            store.save_page(doc_id, p, text, source="ocr", quality=q)
-            unreadable = text.count("[판독불가]")
-            report.append(
-                f"p.{p}: OCR {len(text)}자, quality={q}, 판독불가={unreadable} | 미리보기: {text[:120]!r}"
-            )
+    for p in _parse_pages(pages, meta["page_count"]):
+        r = ocr_page(pdf, p, dpi=dpi)
+        store.save_page(doc_id, p, r["text"], source="ocr", quality=r["quality"])
+        store.save_raw(doc_id, p, r["raw"])
+        report.append(
+            f"p.{p}: OCR {len(r['text'])}자, 글자상자 {r['boxes']}개, 신뢰도={r['quality']} | 미리보기: {r['text'][:120]!r}"
+        )
     return "\n".join(report)
 
 
@@ -203,6 +180,7 @@ def chunk_document(doc_id: str, chunk_size: int = 800, chunk_overlap: int = 120)
                 }
             )
     store.save_chunks(doc_id, chunks)
+    store._write(store.doc_dir(doc_id) / "chunking.json", {"chunk_size": chunk_size, "chunk_overlap": chunk_overlap})
     _bm25_index.cache_clear()
 
     sizes = [len(c["text"]) for c in chunks] or [0]
@@ -248,8 +226,13 @@ def _bm25_index():
 def search_chunks(query: str, k: int = 5, doc_id: str = "") -> str:
     """BM25 키워드 검색으로 관련 청크 상위 k개를 반환한다.
 
+    doc_id: 문서 ID 또는 표시(D3). 여러 문서는 쉼표로 ('D1,D3'). 여러 문서면 결과 머리말에 표시가 붙는다.
     정확도를 위해 하나의 질문을 동의어/세부 키워드로 바꿔 여러 번 검색하는 것을 권장한다.
     """
+    refs = [r.strip() for r in (doc_id or "").split(",") if r.strip()]
+    allowed = {store.resolve(r) for r in refs}
+    show_label = len(refs) > 1 or any(re.fullmatch(r"D\d+", r) for r in refs)
+    names = store.labels() if show_label else {}
     chunks, bm25 = _bm25_index()
     if bm25 is None:
         return "인덱스가 비어 있습니다. 먼저 chunk_document 를 실행하세요."
@@ -258,11 +241,12 @@ def search_chunks(query: str, k: int = 5, doc_id: str = "") -> str:
     out = []
     for i in ranked:
         c = chunks[i]
-        if doc_id and c["doc_id"] != doc_id:
+        if allowed and c["doc_id"] not in allowed:
             continue
         if scores[i] <= 0:
             break
-        out.append(f"[{c['id']} p.{c['page']} §{c['section'] or '-'} score={scores[i]:.2f}]\n{c['text']}")
+        label = f"{names.get(c['doc_id'], '?')} " if show_label else ""
+        out.append(f"[{c['id']} {label}p.{c['page']} §{c['section'] or '-'} score={scores[i]:.2f}]\n{c['text']}")
         if len(out) >= k:
             break
     return "\n\n".join(out) or "일치하는 청크가 없습니다."
@@ -276,6 +260,27 @@ def get_chunk_context(chunk_id: str, window: int = 1) -> str:
     i = int(idx)
     sel = chunks[max(0, i - window) : i + window + 1]
     return "\n\n".join(f"[{c['id']} p.{c['page']}]\n{c['text']}" for c in sel) or "없음"
+
+
+@tool
+def document_outline(doc_id: str) -> str:
+    """문서 전체 구성(페이지별 소제목과 첫 부분)을 보여준다. 요약/보고서처럼 문서 전체를 다룰 때 먼저 호출한다. doc_id 에 표시(D3)도 된다."""
+    doc_id = store.resolve(doc_id)
+    try:
+        meta = store.load_meta(doc_id)
+    except ValueError:
+        return f"알 수 없는 문서: {doc_id}"
+    by_page: dict[int, list[dict]] = {}
+    for c in store.load_chunks(doc_id):
+        by_page.setdefault(c["page"], []).append(c)
+    unit = "구간" if meta.get("unit") == "section" else "페이지"
+    lines = [f"{Path(meta['path']).name} · {meta['page_count']}{unit} · 청크 {sum(map(len, by_page.values()))}개"]
+    for p in range(1, meta["page_count"] + 1):
+        chunks = by_page.get(p, [])
+        sections = list(dict.fromkeys(c["section"] for c in chunks if c["section"]))
+        head = re.sub(r"\s+", " ", chunks[0]["text"])[:120] if chunks else "(내용 없음)"
+        lines.append(f"[p.{p}] " + (f"§{' / '.join(sections[:4])} — " if sections else "") + head)
+    return "\n".join(lines)
 
 
 @tool
